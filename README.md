@@ -5,3 +5,5 @@
 This project isn't licensed, you can use this code without anyone's permission which means that everyone in the Gorilla Tag community can fix this and edit it his own way to create his own loader.
 
 Made with LOVE, EFE.
+
+*The code was made with comments and I renamed the namespaces and classes so it's understandable*.
