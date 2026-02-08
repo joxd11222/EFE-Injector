@@ -164,23 +164,20 @@ namespace EFE_s_NativeInjector.Core
         {
             err = "";
 
-            byte[] encrypted = encrypt(rawDll);
-            Wipe(rawDll);
-
-            byte[] dll = decrypt(encrypted);
-            Wipe(encrypted);
-
             rootDomain = Call(fn["mono_get_root_domain"]);
             if (rootDomain == IntPtr.Zero) { err = "mono_get_root_domain failed"; return IntPtr.Zero; }
 
-            attached = true;
+            if (!attached)
+            {
+                Call(fn["mono_thread_attach"], rootDomain);
+                attached = true;
+            }
 
             IntPtr status = mem.AllocWrite(0);
             allocations.Add(status);
 
-            IntPtr dllPtr = AllocTracked(dll);
-            int dllLen = dll.Length;
-            Wipe(dll);
+            IntPtr dllPtr = AllocTracked(rawDll);
+            int dllLen = rawDll.Length;
 
             IntPtr rawImg = Call(fn["mono_image_open_from_data"],
                 dllPtr,
@@ -189,8 +186,6 @@ namespace EFE_s_NativeInjector.Core
                 status);
 
             if (rawImg == IntPtr.Zero) { err = "mono_image_open_from_data failed"; return IntPtr.Zero; }
-
-            WipeRawDll(dllPtr, (uint)dllLen);
 
             byte[] emptyName = new byte[] { 0 };
             IntPtr namePtr = AllocTracked(emptyName);
@@ -222,41 +217,132 @@ namespace EFE_s_NativeInjector.Core
 
             Call(fn["mono_runtime_invoke"], method, IntPtr.Zero, IntPtr.Zero, exc);
 
-            ErasePEHeader(rawImg);
+            IntPtr excVal = X64 ? (IntPtr)mem.ReadLong(exc) : (IntPtr)mem.ReadInt(exc);
+            if (excVal != IntPtr.Zero)
+            {
+                err = "method threw exception";
+                return IntPtr.Zero;
+            }
+
+            System.Threading.Thread.Sleep(200);
+
+            hideeeee(asm, rawImg, dllPtr, dllLen);
 
             return asm;
         }
 
-        void WipeRawDll(IntPtr addr, uint size)
+        void hideeeee(IntPtr asm, IntPtr imgAddr, IntPtr dllPtr, int dllLen)
         {
-            uint paddedSize = ((size / 4096) + 2) * 4096;
-            byte[] zeros = new byte[paddedSize];
-            uint oldProt;
-            Native.VirtualProtectEx(hProc, addr, paddedSize, Native.PAGE_RW, out oldProt);
-            Native.WriteProcessMemory(hProc, addr, zeros, paddedSize, out _);
+            try
+            {
+                unlinkassembly(asm);
+                corruptmetadata(imgAddr);
+                wiperawdata(imgAddr);
+                wipealloc(dllPtr, dllLen);
+            }
+            catch { }
         }
 
-        void ErasePEHeader(IntPtr imgAddr)
+        void unlinkassembly(IntPtr asm)
         {
             try
             {
                 int ptrSize = X64 ? 8 : 4;
-                byte[] rawDataPtrBytes = mem.Read(imgAddr + (6 * ptrSize), ptrSize);
-                
-                IntPtr rawDataPtr;
-                if (X64)
-                    rawDataPtr = (IntPtr)BitConverter.ToInt64(rawDataPtrBytes, 0);
-                else
-                    rawDataPtr = (IntPtr)BitConverter.ToInt32(rawDataPtrBytes, 0);
 
-                if (rawDataPtr != IntPtr.Zero && rawDataPtr.ToInt64() > 0x10000)
+                byte[] asmNameBytes = mem.Read(asm + (ptrSize * 2), ptrSize);
+                IntPtr asmNamePtr = X64 ?
+                    (IntPtr)BitConverter.ToInt64(asmNameBytes, 0) :
+                    (IntPtr)BitConverter.ToInt32(asmNameBytes, 0);
+
+                if (asmNamePtr != IntPtr.Zero)
                 {
-                    byte[] zeros = new byte[512];
+                    byte[] fakeName = System.Text.Encoding.UTF8.GetBytes("\0");
                     uint oldProt;
-                    Native.VirtualProtectEx(hProc, rawDataPtr, 512, Native.PAGE_RW, out oldProt);
-                    Native.WriteProcessMemory(hProc, rawDataPtr, zeros, 512, out _);
-                    Native.VirtualProtectEx(hProc, rawDataPtr, 512, oldProt, out _);
+                    Native.VirtualProtectEx(hProc, asmNamePtr, (uint)fakeName.Length, Native.PAGE_RW, out oldProt);
+                    Native.WriteProcessMemory(hProc, asmNamePtr, fakeName, (uint)fakeName.Length, out _);
                 }
+
+                IntPtr nullPtr = IntPtr.Zero;
+                byte[] nullBytes = X64 ? BitConverter.GetBytes((long)0) : BitConverter.GetBytes(0);
+
+                uint oldProt2;
+                Native.VirtualProtectEx(hProc, asm, (uint)(ptrSize * 10), Native.PAGE_RW, out oldProt2);
+                Native.WriteProcessMemory(hProc, asm + ptrSize, nullBytes, (uint)nullBytes.Length, out _);
+                Native.WriteProcessMemory(hProc, asm + (ptrSize * 2), nullBytes, (uint)nullBytes.Length, out _);
+            }
+            catch { }
+        }
+
+        void corruptmetadata(IntPtr imgAddr)
+        {
+            try
+            {
+                int ptrSize = X64 ? 8 : 4;
+
+                byte[] nameBytes = mem.Read(imgAddr, ptrSize);
+                IntPtr namePtr = X64 ?
+                    (IntPtr)BitConverter.ToInt64(nameBytes, 0) :
+                    (IntPtr)BitConverter.ToInt32(nameBytes, 0);
+
+                if (namePtr != IntPtr.Zero)
+                {
+                    byte[] zeros = new byte[256];
+                    new Random().NextBytes(zeros);
+                    uint oldProt;
+                    Native.VirtualProtectEx(hProc, namePtr, 256, Native.PAGE_RW, out oldProt);
+                    Native.WriteProcessMemory(hProc, namePtr, zeros, 256, out _);
+                }
+
+                byte[] corrupt = new byte[ptrSize * 30];
+                new Random().NextBytes(corrupt);
+
+                uint oldProt2;
+                Native.VirtualProtectEx(hProc, imgAddr, (uint)corrupt.Length, Native.PAGE_RW, out oldProt2);
+                Native.WriteProcessMemory(hProc, imgAddr, corrupt, (uint)corrupt.Length, out _);
+            }
+            catch { }
+        }
+
+        void wiperawdata(IntPtr imgAddr)
+        {
+            try
+            {
+                int ptrSize = X64 ? 8 : 4;
+
+                byte[] rawDataPtrBytes = mem.Read(imgAddr + (6 * ptrSize), ptrSize);
+                IntPtr rawDataPtr = X64 ?
+                    (IntPtr)BitConverter.ToInt64(rawDataPtrBytes, 0) :
+                    (IntPtr)BitConverter.ToInt32(rawDataPtrBytes, 0);
+
+                byte[] rawDataLenBytes = mem.Read(imgAddr + (7 * ptrSize), 4);
+                int rawDataLen = BitConverter.ToInt32(rawDataLenBytes, 0);
+
+                if (rawDataPtr != IntPtr.Zero && rawDataLen > 0 && rawDataLen < 100000000)
+                {
+                    byte[] garbage = new byte[rawDataLen];
+                    new Random().NextBytes(garbage);
+
+                    uint oldProt;
+                    Native.VirtualProtectEx(hProc, rawDataPtr, (uint)rawDataLen, Native.PAGE_RW, out oldProt);
+                    Native.WriteProcessMemory(hProc, rawDataPtr, garbage, (uint)rawDataLen, out _);
+                    Native.VirtualProtectEx(hProc, rawDataPtr, (uint)rawDataLen, Native.PAGE_NOACCESS, out _);
+                }
+            }
+            catch { }
+        }
+
+        void wipealloc(IntPtr addr, int size)
+        {
+            try
+            {
+                uint paddedSize = (uint)(((size / 4096) + 1) * 4096);
+                byte[] zeros = new byte[paddedSize];
+                new Random().NextBytes(zeros);
+
+                uint oldProt;
+                Native.VirtualProtectEx(hProc, addr, paddedSize, Native.PAGE_RW, out oldProt);
+                Native.WriteProcessMemory(hProc, addr, zeros, paddedSize, out _);
+                Native.VirtualProtectEx(hProc, addr, paddedSize, Native.PAGE_NOACCESS, out _);
             }
             catch { }
         }
